@@ -669,11 +669,14 @@ export function createRecipe(): RecipeDefinition {
       const pushReadings = async (): Promise<void> => {
         if (stopped) return;
         const now = Date.now();
-        const pairs = selection();
+        const pairs = selection().slice(0, MAX_SELECTION);
         let changed = false;
         for (const p of pairs) {
           if (!(HOURLY_ALIASES as readonly string[]).includes(p.alias)) continue;
-          const cur = currentOf(ctx.equipmentManager.getByIdWithDetails(p.equipmentId), p.alias);
+          const eq = ctx.equipmentManager.getByIdWithDetails(p.equipmentId);
+          // Only what may leave the house is kept: a hostile selection cannot grow the state store.
+          if (!isReadable(eq, p.alias, bridgeId)) continue;
+          const cur = currentOf(eq, p.alias);
           series = sampleHourly(series, pairKey(p), cur?.value, now);
           changed = true;
         }
