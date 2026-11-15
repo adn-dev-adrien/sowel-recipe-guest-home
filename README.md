@@ -17,8 +17,8 @@ peut actionner **qu'une lumière que vous avez cochée** dans son unique réglag
 demande, rien d'autre dans la maison n'est joignable par ce chemin.
 
 Le pire cas, accepté par Adrien le 2026-11-15 : quelqu'un qui contrôlerait entièrement guestFlow
-pourrait allumer ou éteindre **les lumières confiées**, au plus 20 fois par heure et par logement,
-et rien d'autre.
+pourrait allumer ou éteindre **chaque lumière confiée**, au plus 20 fois par heure, et rien d'autre.
+Le compte se fait par lumière et non par logement, car c'est guestFlow qui nomme le logement.
 
 ## Le seul réglage : « Lumières confiées aux voyageurs »
 
@@ -38,18 +38,22 @@ validation les refuse.
   type et ce qu'ils mesurent (alias, catégorie, unité). **Aucune valeur.** Une lumière porte
   `guestSwitchable: true` si et seulement si elle est cochée. Jamais deux fois le même, hors le renvoi horaire.
 - **Les relevés** — toutes les 60 s, la valeur, l'unité et l'heure de mesure, **seulement pour les
-  couples que guestFlow a demandés** (`home_selection`). Le reste de la maison ne sort pas.
+  couples que guestFlow a demandés** (`home_selection`) **et que le catalogue décrit**. Un couple
+  hors catalogue (le pont lui-même, un équipement non catalogué, une mesure inconnue) est ignoré :
+  c'est guestFlow qui écrit la sélection, elle ne prouve donc rien. Le reste de la maison ne sort pas.
 - **Les séries** — à chaque heure pleine, la pluie (`rain_1h`) et l'énergie (`energy_hour`) de
   l'heure écoulée sont gardées dans la mémoire de la recette (24 tranches), et envoyées toutes les
   15 min. Après une installation neuve, la courbe se remplit en 24 h.
 - **Les commandes** — une commande n'est exécutée que si **tout** tient :
-  1. l'équipement existe et est une lumière ;
-  2. il est coché dans « Lumières confiées aux voyageurs » ;
+  1. il est coché dans « Lumières confiées aux voyageurs » (vérifié en premier : un refus ne dit
+     rien d'un équipement inconnu) ;
+  2. l'équipement existe et est une lumière ;
   3. la commande a moins de 60 s ;
-  4. moins de 20 commandes pour ce logement dans l'heure (compte gardé à travers un redémarrage).
+  4. moins de 20 commandes pour cette lumière dans l'heure (compte gardé à travers un redémarrage) ;
+  5. ce numéro de commande n'a pas déjà été traité dans l'heure.
 
-  Elle part alors sur l'ordre `state` de la lumière (`ON`/`OFF` pour une énumération,
-  `true`/`false` pour un booléen). Pas de minuterie : la lumière reste comme le voyageur l'a
+  Elle part alors sur l'ordre `state` de la lumière (`ON`/`OFF` pour une énumération qui les
+  nomme, `true`/`false` pour un booléen ; tout autre ordre donne `order_failed`). Pas de minuterie : la lumière reste comme le voyageur l'a
   laissée. Le verdict repart vers guestFlow — `not_a_light`, `not_entrusted`, `too_old`,
   `rate_limited`, `order_failed`, ou `invalid_command` pour une commande illisible. Jamais
   réessayée. Chaque refus est écrit dans le journal de la recette avec le numéro de la commande ;

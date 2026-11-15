@@ -1,0 +1,23 @@
+{
+  "id": "guest-home",
+  "type": "recipe",
+  "name": "Guest home automation",
+  "version": "0.1.0",
+  "description": "Shows guests the house's readings and lets them switch the lights you entrust to them, through the guestFlow plugin. One for the whole house.",
+  "icon": "Lightbulb",
+  "repo": "adn-dev-adrien/sowel-recipe-guest-home",
+  "author": "adn-dev-adrien",
+  "tags": [
+    "guests",
+    "guestflow",
+    "lights",
+    "sensors"
+  ],
+  "i18n": {
+    "fr": {
+      "name": "Domotique des voyageurs",
+      "description": "Montre aux voyageurs les mesures de la maison et leur laisse allumer ou éteindre les lumières que vous leur confiez, par le plugin guestFlow. Une seule pour toute la maison."
+    }
+  },
+  "sowelVersion": ">=1.71.0"
+}
