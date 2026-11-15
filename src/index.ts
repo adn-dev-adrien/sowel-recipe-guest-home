@@ -15,14 +15,15 @@
 //     or a switch carrying a light state), and only one the owner put in the
 //     one setting, « Lumières confiées aux voyageurs »;
 //   • only on/off, only if issued less than 60 s ago, at most 20 an hour per
-//     lodging, never on the first read of the counter after a start, never
-//     retried. No timer: the light stays as switched (gF rule 7).
+//     LIGHT (the lodging is guestFlow's word, so it bounds nothing), each
+//     command id once, never on the first read of the counter after a start,
+//     never retried. No timer: the light stays as switched (gF rule 7).
 //
 // Worst case, accepted by Adrien on 2026-11-15 (gF rule 11): whoever fully
-// controls guestFlow can switch the entrusted lights, 20 times an hour per
-// lodging, and nothing else. Values leave the house only for the pairs
-// guestFlow selected; the catalogue describes sensors and lights by name and
-// zone, never with a value.
+// controls guestFlow can switch each entrusted light 20 times an hour, and
+// nothing else. Values leave the house only for the selected pairs that are in
+// the catalogue — never another equipment's, never the bridge's; the catalogue
+// describes sensors and lights by name and zone, never with a value.
 // ============================================================
 
 // ------------------------------------------------------------
@@ -171,6 +172,9 @@ const HOUR_MS = 60 * 60_000;
 export const MAX_COMMAND_AGE_MS = 60_000;
 export const MAX_COMMANDS_PER_HOUR = 20;
 const MAX_BUCKETS = 24;
+/** More pairs than guestFlow could ever show on one page: the rest is ignored. */
+export const MAX_SELECTION = 200;
+const SELECTION_DEBOUNCE_MS = 2_000;
 
 /** guestFlow's own limits (homePayloads.js): beyond them a whole call is refused. */
 const ID_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
@@ -311,11 +315,27 @@ export interface Reading {
   measuredAt: string;
 }
 
-/** The selection's values, and nothing else. A pair whose equipment is gone is skipped. */
-export function buildReadings(ctx: Pick<RecipeContext, "equipmentManager">, selection: Pair[]): Reading[] {
+/**
+ * May this pair leave the house? Only an alias the catalogue describes, of a
+ * catalogued equipment, never the bridge: guestFlow writes the selection, so
+ * the selection alone proves nothing.
+ */
+export function isReadable(eq: EquipmentDetails | undefined | null, alias: string, bridgeId?: string): eq is EquipmentDetails {
+  if (!eq || eq.id === bridgeId || !ID_RE.test(eq.id) || !isCatalogued(eq)) return false;
+  return readingsOf(eq).some((r) => r.alias === alias);
+}
+
+/** The selection's values, and nothing else. A pair outside the catalogue, or whose equipment is gone, is skipped. */
+export function buildReadings(
+  ctx: Pick<RecipeContext, "equipmentManager">,
+  selection: Pair[],
+  bridgeId?: string,
+): Reading[] {
   const out: Reading[] = [];
-  for (const p of selection) {
-    const cur = currentOf(ctx.equipmentManager.getByIdWithDetails(p.equipmentId), p.alias);
+  for (const p of selection.slice(0, MAX_SELECTION)) {
+    const eq = ctx.equipmentManager.getByIdWithDetails(p.equipmentId);
+    if (!isReadable(eq, p.alias, bridgeId)) continue;
+    const cur = currentOf(eq, p.alias);
     if (!cur || !cur.lastUpdated || Number.isNaN(Date.parse(cur.lastUpdated)) || !isSendable(cur.value)) continue;
     out.push({ equipmentId: p.equipmentId, alias: p.alias, value: cur.value, unit: cur.unit, measuredAt: cur.lastUpdated });
   }
@@ -408,7 +428,7 @@ export function isNewCommand(previous: number | null, incoming: unknown): boolea
 
 /**
  * The checks, in order. `history` is the times of the commands already let
- * through for this property; returns the refusal, or null.
+ * through for this light; returns the refusal, or null.
  */
 export function refusalOf(
   command: Command,
@@ -417,8 +437,9 @@ export function refusalOf(
   history: number[],
   now: number,
 ): Reason | null {
-  if (!isLight(light)) return "not_a_light";
+  // The whitelist first: a refusal must not tell guestFlow what an unknown id is.
   if (!whitelist.has(command.equipmentId)) return "not_entrusted";
+  if (!isLight(light)) return "not_a_light";
   const age = now - Date.parse(command.issuedAt);
   // A command from the future is no fresher than an old one: a clock is wrong somewhere.
   if (!Number.isFinite(age) || age >= MAX_COMMAND_AGE_MS || age <= -MAX_COMMAND_AGE_MS) return "too_old";
@@ -437,8 +458,51 @@ export function lightOrder(
     orders.find((o) => o.category === "light_toggle" || o.category === "toggle_power");
   if (!order) return null;
   if (order.type === "boolean") return { alias: order.alias, value: target === "on" };
+  // Only an enum that names on and off: any other order type is no light switch we know how to drive.
   const match = order.enumValues?.find((v) => v.toLowerCase() === target);
-  return { alias: order.alias, value: match ?? target.toUpperCase() };
+  return match ? { alias: order.alias, value: match } : null;
+}
+
+/** A restored `{ key: number[] }`, whatever was stored: anything else is dropped. */
+export function timesOf(raw: unknown): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (Array.isArray(v)) out[k] = v.filter((t): t is number => typeof t === "number" && Number.isFinite(t));
+  }
+  return out;
+}
+
+/** A restored `{ key: number }`, whatever was stored. */
+export function timeOf(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+}
+
+/** The last hour only; an empty key is dropped, so the store never grows past an hour of commands. */
+export function pruneTimes(rate: Record<string, number[]>, now: number): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
+  for (const [k, list] of Object.entries(rate)) {
+    const kept = list.filter((t) => now - t < HOUR_MS);
+    if (kept.length) out[k] = kept;
+  }
+  return out;
+}
+
+export function recentOf(seen: Record<string, number>, now: number): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, t] of Object.entries(seen)) if (now - t < HOUR_MS) out[k] = t;
+  return out;
+}
+
+/** The series of the pairs still selected, and no other. */
+export function keepSeries(store: SeriesStore, keys: ReadonlySet<string>): SeriesStore {
+  const pick = <T>(rec: Record<string, T>) => Object.fromEntries(Object.entries(rec).filter(([k]) => keys.has(k)));
+  return { pending: pick(store.pending), buckets: pick(store.buckets) };
 }
 
 // ------------------------------------------------------------
@@ -540,6 +604,7 @@ export function createRecipe(): RecipeDefinition {
       let stopped = false;
       let lastCatalog = "";
       let catalogTimer: ReturnType<typeof setTimeout> | null = null;
+      let selectionTimer: ReturnType<typeof setTimeout> | null = null;
       /** The counter as last seen. `null` until the first reading — see isNewCommand. */
       let lastSeq: number | null = null;
       let queue: Promise<void> = Promise.resolve();
@@ -551,8 +616,9 @@ export function createRecipe(): RecipeDefinition {
         restoredSeries && typeof restoredSeries === "object" && restoredSeries.pending && restoredSeries.buckets
           ? restoredSeries
           : { pending: {}, buckets: {} };
-      const restoredRate = ctx.state.get("rate") as Record<string, number[]> | null;
-      let rate: Record<string, number[]> = restoredRate && typeof restoredRate === "object" ? restoredRate : {};
+      let rate = timesOf(ctx.state.get("rate"));
+      /** Command id → when it was handled: a command is acted on once, whatever guestFlow resends. */
+      let seen = timeOf(ctx.state.get("seen"));
 
       const summary = (): void => {
         const n = whitelist.size;
@@ -611,15 +677,18 @@ export function createRecipe(): RecipeDefinition {
           series = sampleHourly(series, pairKey(p), cur?.value, now);
           changed = true;
         }
+        series = keepSeries(series, new Set(pairs.map(pairKey)));
         if (changed) ctx.state.set("series", series);
-        const readings = buildReadings(ctx, pairs);
+        const readings = buildReadings(ctx, pairs, bridgeId);
         if (readings.length) await send(ORDER_READINGS, readings, "relevés");
       };
 
       const pushSeries = async (): Promise<void> => {
         if (stopped) return;
         const out = selection()
+          .slice(0, MAX_SELECTION)
           .filter((p) => (HOURLY_ALIASES as readonly string[]).includes(p.alias))
+          .filter((p) => isReadable(ctx.equipmentManager.getByIdWithDetails(p.equipmentId), p.alias, bridgeId))
           .map((p) => ({ equipmentId: p.equipmentId, alias: p.alias, buckets: series.buckets[pairKey(p)] ?? [] }))
           .filter((s) => s.buckets.length > 0);
         if (out.length) await send(ORDER_SERIES, out, "séries horaires");
@@ -641,9 +710,18 @@ export function createRecipe(): RecipeDefinition {
         }
         const command = parsed.command;
         const now = Date.now();
+        seen = recentOf(seen, now);
+        if (seen[String(command.id)] !== undefined) {
+          ctx.log(`commande ${command.id} déjà traitée — rien n'est actionné à nouveau`, "warn");
+          return;
+        }
+        seen = { ...seen, [String(command.id)]: now };
+        ctx.state.set("seen", seen);
         const light = ctx.equipmentManager.getByIdWithDetails(command.equipmentId);
-        const key = String(command.propertyId);
-        const history = (rate[key] ?? []).filter((t) => now - t < HOUR_MS);
+        // Per light: the lodging is chosen by guestFlow, so a limit on it bounds nothing.
+        rate = pruneTimes(rate, now);
+        const key = command.equipmentId;
+        const history = rate[key] ?? [];
         const refusal = refusalOf(command, light, whitelist, history, now);
         if (refusal) {
           ctx.log(`commande ${command.id} refusée (${refusal}) pour « ${light?.name ?? command.equipmentId} »`, "warn");
@@ -689,10 +767,17 @@ export function createRecipe(): RecipeDefinition {
           lastSeq = incoming as number;
           // Read now: the plugin wrote the command just before moving the counter.
           const raw = bridgeValue(DATA_COMMAND);
-          queue = queue.then(() => execute(raw)).catch(() => {});
+          queue = queue
+            .then(() => execute(raw))
+            .catch((err) => ctx.log(`commande non traitée — ${errText(err)}`, "error"));
           return;
         }
-        if (event.alias === DATA_SELECTION) void pushReadings();
+        if (event.alias === DATA_SELECTION && !stopped && !selectionTimer) {
+          selectionTimer = setTimeout(() => {
+            selectionTimer = null;
+            void pushReadings();
+          }, SELECTION_DEBOUNCE_MS);
+        }
       });
       const unsubs = [
         ctx.eventBus.onType("equipment.created", catalogSoon),
@@ -725,6 +810,8 @@ export function createRecipe(): RecipeDefinition {
           clearInterval(catalogHourly);
           if (catalogTimer) clearTimeout(catalogTimer);
           catalogTimer = null;
+          if (selectionTimer) clearTimeout(selectionTimer);
+          selectionTimer = null;
         },
       };
     },

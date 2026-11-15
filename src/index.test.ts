@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildCatalog,
   createRecipe,
+  keepSeries,
+  lightOrder,
+  pruneTimes,
   sampleHourly,
+  timeOf,
+  timesOf,
   type EquipmentDetails,
   type RecipeContext,
   type SeriesStore,
@@ -10,8 +15,9 @@ import {
 
 // What these tests guard: the whitelist is the house's boundary. A command from
 // guestFlow must never reach anything but an entrusted light — not on a
-// restart, not on a repeated counter, not when stale, not beyond 20 an hour —
-// and every refusal is reported. Values leave only for the selection.
+// restart, not on a repeated counter or id, not when stale, not beyond 20 an
+// hour per light — and every refusal is reported. Values leave only for the
+// selected pairs the catalogue describes.
 
 type Handler = (event: Record<string, unknown>) => void;
 
@@ -236,7 +242,7 @@ describe("readings and series", () => {
         { equipmentId: "eq-gone", alias: "temperature" },
       ]),
     );
-    await flush();
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(toBridge("home_readings")).toEqual([
       [
         { equipmentId: "eq-temp", alias: "temperature", value: 21.4, unit: "°C", measuredAt: ISO(NOW - 30_000) },
@@ -279,6 +285,40 @@ describe("readings and series", () => {
     store = sampleHourly(store, "k", 5, t0 + 40 * 3_600_000);
     expect(store.buckets.k.at(-1)?.value).toBe(28);
     expect(store.buckets.k.length).toBeLessThan(24); // the window slid by 11 hours
+  });
+
+  it("sends nothing guestFlow selected outside the catalogue: not the bridge, not an uncatalogued equipment, not an unknown alias", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const { ctx, setBridge, toBridge } = makeCtx();
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge(
+      "home_selection",
+      JSON.stringify([
+        { equipmentId: BRIDGE, alias: "home_command" },
+        { equipmentId: "eq-pump", alias: "state" },
+        { equipmentId: "eq-temp", alias: "secret" },
+        { equipmentId: "eq-temp", alias: "humidity" },
+      ]),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(toBridge("home_readings")).toEqual([
+      [{ equipmentId: "eq-temp", alias: "humidity", value: 48, unit: "%", measuredAt: ISO(NOW - 30_000) }],
+    ]);
+    handle.stop();
+  });
+
+  it("forgets the series of a pair no longer selected", () => {
+    const store: SeriesStore = { pending: { a: { hour: 0, value: 1 }, b: { hour: 0, value: 2 } }, buckets: { a: [], b: [] } };
+    expect(keepSeries(store, new Set(["a"]))).toEqual({ pending: { a: { hour: 0, value: 1 } }, buckets: { a: [] } });
+  });
+});
+
+describe("restored state", () => {
+  it("drops whatever is not a list of times, and an hour-old entry", () => {
+    expect(timesOf({ a: "x", b: [1, "2", 3], c: null })).toEqual({ b: [1, 3] });
+    expect(timesOf([1, 2])).toEqual({});
+    expect(pruneTimes({ a: [NOW - 3_600_000], b: [NOW - 10] }, NOW)).toEqual({ b: [NOW - 10] });
+    expect(timeOf({ "1": NOW, "2": "x" })).toEqual({ "1": NOW });
   });
 });
 
@@ -335,7 +375,8 @@ describe("commands", () => {
   it("refuses a non-light, a light off the whitelist, a 61 s old command — reported, logged, nothing actuated", async () => {
     vi.useFakeTimers({ now: NOW });
     const { ctx, sendCommand, toHouse, toBridge, logs } = makeCtx();
-    const handle = createRecipe().createInstance(PARAMS, ctx);
+    // eq-pump whitelisted by an older configuration: still no light, still refused.
+    const handle = createRecipe().createInstance({ ...PARAMS, lights: [...PARAMS.lights, "eq-pump"] }, ctx);
     sendCommand(cmd(1, "eq-gate"));
     sendCommand(cmd(2, "eq-pump"));
     sendCommand(cmd(3, "eq-unknown"));
@@ -346,9 +387,10 @@ describe("commands", () => {
     await flush();
     expect(toHouse()).toEqual([]);
     expect(toBridge("home_result")).toEqual([
-      { id: 1, ok: false, reason: "not_a_light" },
+      // The whitelist is checked first: a refusal says nothing about what an unknown id is.
+      { id: 1, ok: false, reason: "not_entrusted" },
       { id: 2, ok: false, reason: "not_a_light" },
-      { id: 3, ok: false, reason: "not_a_light" },
+      { id: 3, ok: false, reason: "not_entrusted" },
       { id: 4, ok: false, reason: "not_entrusted" },
       { id: 5, ok: false, reason: "too_old" },
       { id: 6, ok: false, reason: "too_old" },
@@ -360,12 +402,13 @@ describe("commands", () => {
     handle.stop();
   });
 
-  it("refuses the 21st command of an hour for a lodging, not another lodging's, and lets it through an hour later", async () => {
+  it("refuses the 21st command of an hour for a light, whatever lodging guestFlow names, not another light's; an hour later it passes", async () => {
     vi.useFakeTimers({ now: NOW });
     const { ctx, sendCommand, toHouse, toBridge } = makeCtx();
     const handle = createRecipe().createInstance(PARAMS, ctx);
-    for (let i = 1; i <= 21; i += 1) sendCommand(cmd(i, "eq-lamp", i % 2 ? "on" : "off"));
-    sendCommand(cmd(22, "eq-lamp", "on", 5_000, 2));
+    for (let i = 1; i <= 20; i += 1) sendCommand(cmd(i, "eq-lamp", i % 2 ? "on" : "off", 5_000, i));
+    sendCommand(cmd(21, "eq-lamp", "on", 5_000, 99));
+    sendCommand(cmd(22, "eq-terrace", "on"));
     await flush();
     expect(toHouse()).toHaveLength(21);
     expect(toBridge("home_result")[20]).toEqual({ id: 21, ok: false, reason: "rate_limited" });
@@ -390,6 +433,25 @@ describe("commands", () => {
     await flush();
     expect(second.toBridge("home_result")).toEqual([{ id: 21, ok: false, reason: "rate_limited" }]);
     h2.stop();
+  });
+
+  it("acts on a command id once, whatever guestFlow resends", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const { ctx, sendCommand, toHouse, toBridge } = makeCtx();
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    sendCommand(cmd(1, "eq-lamp"));
+    sendCommand(cmd(1, "eq-lamp"));
+    await flush();
+    expect(toHouse()).toHaveLength(1);
+    expect(toBridge("home_result")).toEqual([{ id: 1, ok: true }]);
+    handle.stop();
+  });
+
+  it("drives no order it cannot read as on/off", () => {
+    const light = (o: Record<string, unknown>) => ({ id: "x", type: "light_onoff", orderBindings: [{ alias: "state", ...o }] });
+    expect(lightOrder(light({ type: "number" }), "on")).toBeNull();
+    expect(lightOrder(light({ type: "enum", enumValues: ["LOW", "HIGH"] }), "on")).toBeNull();
+    expect(lightOrder(light({ type: "enum", enumValues: ["on", "off"] }), "off")).toEqual({ alias: "state", value: "off" });
   });
 
   it("reports order_failed when the light refuses, and never retries", async () => {
