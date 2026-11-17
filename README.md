@@ -10,20 +10,26 @@ device « home-bridge » ; cette recette est ce qui lit la maison, décide et ac
 
 ## Pourquoi une recette, et pas le plugin lui-même
 
-Parce que **rien de ce qui décide ne doit aussi actionner**. Un jeton d'API Sowel ne se restreint
+Parce que **rien de ce qui décide ne doit aussi actionner, ni rien dire de plus que ce qu'on lui confie**. Un jeton d'API Sowel ne se restreint
 pas : guestFlow n'en détient donc aucun, c'est la maison qui l'appelle. Le plugin parle à Internet
 et ne fait que porter les messages ; il n'envoie d'ordre à aucun équipement. La recette, elle, ne
 peut actionner **qu'une lumière que vous avez cochée** dans son unique réglage — quoi que guestFlow
-demande, rien d'autre dans la maison n'est joignable par ce chemin.
+demande, rien d'autre dans la maison n'est joignable par ce chemin. Et elle ne **décrit** à guestFlow
+que les équipements de son second réglage : le reste de la maison n'existe pas pour lui.
 
 Le pire cas, accepté par Adrien le 2026-11-15 : quelqu'un qui contrôlerait entièrement guestFlow
 pourrait allumer ou éteindre **chaque lumière confiée**, au plus 20 fois par heure, et rien d'autre.
 Le compte se fait par lumière et non par logement, car c'est guestFlow qui nomme le logement.
 
-## Le seul réglage : « Lumières confiées aux voyageurs »
+## Deux réglages, deux frontières
 
-Une liste de lumières à cocher, remplie une fois. C'est la frontière de sécurité : aucune commande
-n'atteint une lumière hors de cette liste. Tout le reste — quel logement montre quoi, les libellés,
+**« Capteurs partagés »** (depuis la 0.2.0) — les seuls capteurs, thermostats, stations météo et
+compteurs d'énergie dont guestFlow peut connaître le nom, la zone et les mesures. C'est la frontière
+de lecture : un équipement non coché n'est jamais décrit, donc jamais demandé, jamais envoyé, quoi
+que guestFlow demande. Laissé vide, aucun capteur n'est décrit.
+
+**« Lumières confiées aux voyageurs »** — une liste de lumières à cocher, remplie une fois. C'est la
+frontière d'action : aucune commande n'atteint une lumière hors de cette liste. Tout le reste — quel logement montre quoi, les libellés,
 quelle lumière confiée est « Pilotable » dans quel logement — se règle dans le Studio de guestFlow.
 
 Une lumière, c'est un équipement `light_onoff`, `light_dimmable`, `light_color`, ou un `switch`
@@ -32,18 +38,26 @@ validation les refuse.
 
 ## Ce qu'elle fait
 
-- **Le catalogue** — au démarrage, à chaque équipement créé, renommé, déplacé ou supprimé (et à
-  chaque zone renommée), puis toutes les heures : les capteurs, thermostats, stations météo,
-  compteurs d'énergie et lumières de la maison, avec leur nom, leur zone (« Gîte › Salon »), leur
-  type et ce qu'ils mesurent (alias, catégorie, unité). **Aucune valeur.** Une lumière porte
-  `guestSwitchable: true` si et seulement si elle est cochée. Jamais deux fois le même, hors le renvoi horaire.
-- **Les relevés** — toutes les 60 s, la valeur, l'unité et l'heure de mesure, **seulement pour les
-  couples que guestFlow a demandés** (`home_selection`) **et que le catalogue décrit**. Un couple
-  hors catalogue (le pont lui-même, un équipement non catalogué, une mesure inconnue) est ignoré :
-  c'est guestFlow qui écrit la sélection, elle ne prouve donc rien. Le reste de la maison ne sort pas.
-- **Les séries** — à chaque heure pleine, la pluie (`rain_1h`) et l'énergie (`energy_hour`) de
-  l'heure écoulée sont gardées dans la mémoire de la recette (24 tranches), et envoyées toutes les
-  15 min. Après une installation neuve, la courbe se remplit en 24 h.
+Tout ce qu'elle envoie est une valeur que Sowel détient déjà : **elle ne calcule rien**. Et chaque
+envoi étant un ordre du pont, inscrit dans le journal d'activité de Sowel, **elle n'envoie que ce qui
+a changé**.
+
+- **Le catalogue** — au démarrage, puis à chaque équipement créé, renommé, déplacé ou supprimé (et à
+  chaque zone renommée), **seulement s'il a changé** : les capteurs partagés et les lumières confiées,
+  avec leur nom, leur zone (« Gîte › Salon »), leur type et ce qu'ils mesurent (alias, catégorie,
+  unité). **Aucune valeur.** Une lumière porte `guestSwitchable: true` si et seulement si elle est
+  cochée. Le plugin garde le dernier et le renvoie lui-même à guestFlow chaque heure, sans ordre.
+- **Les relevés** — chaque minute, la recette compare ; elle n'envoie que **les couples dont la
+  valeur a changé** (ou, pour une valeur stable, une fois par heure, pour que guestFlow sache que Sowel
+  la mesure toujours), seulement s'ils sont demandés par guestFlow (`home_selection`) **et décrits
+  par le catalogue**. Rien n'a changé : aucun ordre. Un envoi raté est refait à la minute suivante.
+  Le **min/max du jour** est celui que Sowel suit depuis minuit (`temperature_min_today` /
+  `temperature_max_today`) : relayé comme une mesure ordinaire quand l'équipement l'a — aujourd'hui
+  les stations météo ; les simples sondes avec la spec 211 de sowel-core.
+- **Les séries** — une fois par heure close, les 24 dernières tranches horaires de la pluie et de
+  l'énergie, **lues dans l'historique de Sowel** (`ctx.history`, spec 211 de sowel-core) et
+  transmises telles quelles. Sans cet accès (un Sowel plus ancien), aucune série n'est envoyée —
+  jamais d'estimation ; tout le reste fonctionne.
 - **Les commandes** — une commande n'est exécutée que si **tout** tient :
   1. il est coché dans « Lumières confiées aux voyageurs » (vérifié en premier : un refus ne dit
      rien d'un équipement inconnu) ;
@@ -74,10 +88,12 @@ validation les refuse.
    `home_command`, `home_command_seq`).
 3. Source personnelle (spec 136) : **Plugins → Store → Sources personnelles** →
    `adn-dev-adrien/sowel-recipe-guest-home` → Installer → confirmer l'empreinte.
-4. Une seule instance : la zone de la tuile, l'équipement du pont, et les lumières confiées.
+4. Une seule instance : la zone de la tuile, l'équipement du pont, les **capteurs partagés** et les
+   lumières confiées. En passant de la 0.1.0 à la 0.2.0, modifier l'instance pour remplir « Capteurs
+   partagés » : tant qu'il est vide, guestFlow ne voit que les lumières.
 
-La validation refuse un pont sans ses quatre ordres et ses trois données, et une « lumière » qui
-n'en est pas une.
+La validation refuse un pont sans ses quatre ordres et ses trois données, une « lumière » qui
+n'en est pas une, et un capteur partagé qui n'est ni capteur, ni thermostat, ni station, ni compteur.
 
 ## Licence
 
