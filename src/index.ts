@@ -21,9 +21,16 @@
 //
 // Worst case, accepted by Adrien on 2026-11-15 (gF rule 11): whoever fully
 // controls guestFlow can switch each entrusted light 20 times an hour, and
-// nothing else. Values leave the house only for the selected pairs that are in
-// the catalogue — never another equipment's, never the bridge's; the catalogue
-// describes sensors and lights by name and zone, never with a value.
+// nothing else. The catalogue describes ONLY the equipments of the second
+// setting, « Capteurs partagés », plus the entrusted lights (gF rule 24), by
+// name and zone, never with a value; values leave the house only for the
+// selected pairs it describes — never another equipment's, never the bridge's.
+//
+// Every figure sent is one Sowel already holds (gF rule 25): current values,
+// the day's min/max Sowel tracks, and hourly buckets read from Sowel's own
+// history when the core offers it. Nothing is computed here. And only what
+// changed is sent (gF rule 26): each send is a bridge order, written into
+// Sowel's activity feed.
 // ============================================================
 
 // ------------------------------------------------------------
@@ -123,6 +130,19 @@ export interface RecipeContext {
     alias: string,
     value: unknown,
   ): Promise<{ success?: boolean; error?: string } | void>;
+  /**
+   * Sowel's own history, read-only (sowel-core spec 211 R2). Optional: an older
+   * core has none, and the recipe then sends no series rather than estimate one.
+   */
+  history?: {
+    query(params: {
+      equipmentId: string;
+      alias: string;
+      from: string;
+      to?: string;
+      aggregation: "1h" | "1d";
+    }): Promise<{ points: { time: string; value: number; min?: number; max?: number }[] }>;
+  };
 }
 
 interface RecipeInstanceHandle {
@@ -161,12 +181,14 @@ export const CATALOG_TYPES = [
   ...LIGHT_TYPES,
   "switch",
 ] as const;
+/** What « Capteurs partagés » offers: every catalogued type but the lights. */
+export const SENSOR_TYPES = ["sensor", "thermostat", "weather", "energy_meter", "main_energy_meter"] as const;
 /** The aliases whose hourly value makes a 24-bar series (Sowel's aggregators; Netatmo's native one). */
 export const HOURLY_ALIASES = ["rain_1h", "sum_rain_1", "energy_hour"] as const;
 
 export const READINGS_EVERY_MS = 60_000;
-export const SERIES_EVERY_MS = 15 * 60_000;
-const CATALOG_EVERY_MS = 60 * 60_000;
+/** An unchanged value is resent this long after the last send, so guestFlow knows Sowel still reports it. */
+export const READING_REFRESH_MS = 60 * 60_000;
 const CATALOG_DEBOUNCE_MS = 2_000;
 const HOUR_MS = 60 * 60_000;
 export const MAX_COMMAND_AGE_MS = 60_000;
@@ -241,18 +263,22 @@ function readingsOf(eq: EquipmentDetails): CatalogEntry["readings"] {
 }
 
 /**
- * The house as guestFlow may know it: every catalogued equipment, its readable
- * values, NO value. `guestSwitchable` is true exactly for the whitelisted lights.
+ * The house as guestFlow may know it: the shared equipments and the entrusted
+ * lights, their readable values, NO value. `guestSwitchable` is true exactly for
+ * the whitelisted lights.
  */
 export function buildCatalog(
   ctx: Pick<RecipeContext, "equipmentManager" | "zoneManager">,
   whitelist: ReadonlySet<string>,
   /** The bridge itself: it is the channel, not part of the house. */
-  exclude?: string,
+  exclude: string | undefined,
+  /** « Capteurs partagés »: with the whitelisted lights, the only equipments ever described. */
+  shared: ReadonlySet<string>,
 ): CatalogEntry[] {
   const entries: CatalogEntry[] = [];
   for (const e of ctx.equipmentManager.getAll()) {
     if (e.id === exclude || !ID_RE.test(e.id)) continue;
+    if (!shared.has(e.id) && !whitelist.has(e.id)) continue;
     const eq = ctx.equipmentManager.getByIdWithDetails(e.id);
     if (!eq || !isCatalogued(eq)) continue;
     const name = (eq.name ?? e.name ?? "").trim().slice(0, 120) || eq.id;
@@ -320,21 +346,27 @@ export interface Reading {
  * catalogued equipment, never the bridge: guestFlow writes the selection, so
  * the selection alone proves nothing.
  */
-export function isReadable(eq: EquipmentDetails | undefined | null, alias: string, bridgeId?: string): eq is EquipmentDetails {
-  if (!eq || eq.id === bridgeId || !ID_RE.test(eq.id) || !isCatalogued(eq)) return false;
+export function isReadable(
+  eq: EquipmentDetails | undefined | null,
+  alias: string,
+  bridgeId: string | undefined,
+  described: ReadonlySet<string>,
+): eq is EquipmentDetails {
+  if (!eq || eq.id === bridgeId || !described.has(eq.id) || !ID_RE.test(eq.id) || !isCatalogued(eq)) return false;
   return readingsOf(eq).some((r) => r.alias === alias);
 }
 
-/** The selection's values, and nothing else. A pair outside the catalogue, or whose equipment is gone, is skipped. */
+/** The selection's values, and nothing else. A pair outside the catalogue (`described`), or whose equipment is gone, is skipped. */
 export function buildReadings(
   ctx: Pick<RecipeContext, "equipmentManager">,
   selection: Pair[],
-  bridgeId?: string,
+  bridgeId: string | undefined,
+  described: ReadonlySet<string>,
 ): Reading[] {
   const out: Reading[] = [];
   for (const p of selection.slice(0, MAX_SELECTION)) {
     const eq = ctx.equipmentManager.getByIdWithDetails(p.equipmentId);
-    if (!isReadable(eq, p.alias, bridgeId)) continue;
+    if (!isReadable(eq, p.alias, bridgeId, described)) continue;
     const cur = currentOf(eq, p.alias);
     if (!cur || !cur.lastUpdated || Number.isNaN(Date.parse(cur.lastUpdated)) || !isSendable(cur.value)) continue;
     out.push({ equipmentId: p.equipmentId, alias: p.alias, value: cur.value, unit: cur.unit, measuredAt: cur.lastUpdated });
@@ -347,39 +379,39 @@ export interface Bucket {
   value: number;
 }
 
-export interface SeriesStore {
-  /** pairKey → the last sample of the hour in progress. */
-  pending: Record<string, { hour: number; value: number }>;
-  /** pairKey → the closed hours, oldest first, 24 at most. */
-  buckets: Record<string, Bucket[]>;
-}
 
 export const pairKey = (p: Pair) => `${p.equipmentId}|${p.alias}`;
-const hourOf = (ms: number) => Math.floor(ms / HOUR_MS) * HOUR_MS;
 
 /**
- * One sample of an hourly alias. When the hour turned, the previous hour's last
- * sample becomes its bucket. Returns the new store (the input is not mutated).
+ * Should this reading go out? Only when its value changed since the last send,
+ * or when the last send is an hour older than Sowel's own time stamp — so a
+ * steady value does not look abandoned to guestFlow (gF rule 27's 6 h limit).
  */
-export function sampleHourly(store: SeriesStore, key: string, value: unknown, now: number): SeriesStore {
-  const next: SeriesStore = { pending: { ...store.pending }, buckets: { ...store.buckets } };
-  const hour = hourOf(now);
-  const pending = next.pending[key];
-  if (pending && pending.hour < hour) {
-    // Only the hour just closed: a sample left from before a long stop is no measure of it.
-    if (pending.hour === hour - HOUR_MS) {
-      const list = [...(next.buckets[key] ?? []), { time: new Date(pending.hour).toISOString(), value: pending.value }];
-      next.buckets[key] = list.slice(-MAX_BUCKETS);
-    }
-    delete next.pending[key];
-  }
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-    next.pending[key] = { hour, value };
-  }
-  // The window is the last 24 hours, whatever the number of buckets kept.
-  const oldest = hour - MAX_BUCKETS * HOUR_MS;
-  if (next.buckets[key]) next.buckets[key] = next.buckets[key].filter((b) => Date.parse(b.time) >= oldest);
-  return next;
+export function hasChanged(last: { value: unknown; measuredAt: string } | undefined, r: Reading): boolean {
+  if (!last) return true;
+  if (JSON.stringify(last.value) !== JSON.stringify(r.value)) return true;
+  return Date.parse(r.measuredAt) - Date.parse(last.measuredAt) >= READING_REFRESH_MS;
+}
+
+/**
+ * The alias Sowel historises for an hourly figure. `energy_hour` and the rain
+ * gauge's hourly cumuls are live computed values; their history is the
+ * underlying binding's, whose alias names its category (`energy`, `rain`).
+ * Falls back to the alias itself.
+ */
+export function historyAliasOf(eq: EquipmentDetails, alias: string): string {
+  const all = [...(eq.dataBindings ?? []), ...(eq.computedData ?? [])];
+  const category = all.find((b) => b.alias === alias)?.category;
+  if (category && (eq.dataBindings ?? []).some((b) => b.alias === category)) return category;
+  return alias;
+}
+
+/** Sowel's hourly points as guestFlow takes them: finite, not negative, the 24 latest. */
+export function bucketsOf(points: { time: string; value: number }[]): Bucket[] {
+  return points
+    .filter((p) => typeof p.time === "string" && typeof p.value === "number" && Number.isFinite(p.value) && p.value >= 0)
+    .map((p) => ({ time: p.time, value: p.value }))
+    .slice(-MAX_BUCKETS);
 }
 
 export interface Command {
@@ -499,12 +531,6 @@ export function recentOf(seen: Record<string, number>, now: number): Record<stri
   return out;
 }
 
-/** The series of the pairs still selected, and no other. */
-export function keepSeries(store: SeriesStore, keys: ReadonlySet<string>): SeriesStore {
-  const pick = <T>(rec: Record<string, T>) => Object.fromEntries(Object.entries(rec).filter(([k]) => keys.has(k)));
-  return { pending: pick(store.pending), buckets: pick(store.buckets) };
-}
-
 // ------------------------------------------------------------
 // Slots and i18n
 // ------------------------------------------------------------
@@ -518,6 +544,11 @@ const FR = {
     bridge: {
       name: "Pont guestFlow",
       description: "L'équipement lié au device « home-bridge » (Domotique GuestFlow) du plugin guestFlow.",
+    },
+    sensors: {
+      name: "Capteurs partagés",
+      description:
+        "Les seuls équipements dont guestFlow peut connaître le nom et les mesures. Rien d'autre de la maison ne lui est décrit, quoi qu'il demande.",
     },
     lights: {
       name: "Lumières confiées aux voyageurs",
@@ -539,6 +570,16 @@ function buildSlots(): RecipeSlotDef[] {
       constraints: { crossZone: true },
     },
     {
+      id: "sensors",
+      name: "Shared sensors",
+      description:
+        "The only equipments whose name and readings guestFlow may know. Nothing else of the house is described to it, whatever it asks.",
+      type: "equipment",
+      required: false,
+      list: true,
+      constraints: { equipmentType: [...SENSOR_TYPES], crossZone: true },
+    },
+    {
       id: "lights",
       name: "Lights entrusted to guests",
       description:
@@ -551,11 +592,13 @@ function buildSlots(): RecipeSlotDef[] {
   ];
 }
 
-export function whitelistOf(params: Record<string, unknown>): Set<string> {
-  const raw = params.lights;
+function idsOf(raw: unknown): Set<string> {
   const list = Array.isArray(raw) ? raw : typeof raw === "string" && raw ? raw.split(",") : [];
   return new Set(list.filter((x): x is string => typeof x === "string" && x.length > 0));
 }
+
+export const whitelistOf = (params: Record<string, unknown>): Set<string> => idsOf(params.lights);
+export const sharedOf = (params: Record<string, unknown>): Set<string> => idsOf(params.sensors);
 
 const hhmm = (ms: number): string =>
   new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris" }).format(new Date(ms));
@@ -590,6 +633,11 @@ export function createRecipe(): RecipeDefinition {
           throw new Error(`The bridge equipment has no « ${alias} » reading — bind the home-bridge device's data to it`);
         }
       }
+      for (const id of sharedOf(params)) {
+        const eq = ctx.equipmentManager.getByIdWithDetails(id);
+        if (!eq) throw new Error(`Shared sensor not found: ${id}`);
+        if (!isCatalogued(eq)) throw new Error(`« ${eq.name ?? id} » cannot be shared: not a sensor, meter or weather station`);
+      }
       for (const id of whitelistOf(params)) {
         const light = ctx.equipmentManager.getByIdWithDetails(id);
         if (!light) throw new Error(`Entrusted light not found: ${id}`);
@@ -600,6 +648,8 @@ export function createRecipe(): RecipeDefinition {
     createInstance(params, ctx) {
       const bridgeId = params.bridge as string;
       const whitelist = whitelistOf(params);
+      const shared = sharedOf(params);
+      const described = new Set([...shared, ...whitelist]);
 
       let stopped = false;
       let lastCatalog = "";
@@ -610,19 +660,19 @@ export function createRecipe(): RecipeDefinition {
       let queue: Promise<void> = Promise.resolve();
       let executed = 0;
       let lastAt: number | null = null;
-
-      const restoredSeries = ctx.state.get("series") as SeriesStore | null;
-      let series: SeriesStore =
-        restoredSeries && typeof restoredSeries === "object" && restoredSeries.pending && restoredSeries.buckets
-          ? restoredSeries
-          : { pending: {}, buckets: {} };
+      /** pairKey → what guestFlow last received: only a change goes out again. */
+      let lastSent = new Map<string, { value: unknown; measuredAt: string }>();
+      /** The hour whose series were last sent; -1 = never. */
+      let seriesHour = -1;
+      // 0.1.0 kept its own hourly samples here; Sowel's history replaces them.
+      if (ctx.state.get("series") !== null) ctx.state.set("series", null);
       let rate = timesOf(ctx.state.get("rate"));
       /** Command id → when it was handled: a command is acted on once, whatever guestFlow resends. */
       let seen = timeOf(ctx.state.get("seen"));
 
       const summary = (): void => {
         const n = whitelist.size;
-        const base = `${n} lumière${n > 1 ? "s" : ""} confiée${n > 1 ? "s" : ""}`;
+        const base = `${shared.size} capteur${shared.size > 1 ? "s" : ""} partagé${shared.size > 1 ? "s" : ""} · ${n} lumière${n > 1 ? "s" : ""} confiée${n > 1 ? "s" : ""}`;
         ctx.state.set(
           "summary",
           executed && lastAt ? `${base} · ${executed} commande${executed > 1 ? "s" : ""}, dernière à ${hhmm(lastAt)}` : base,
@@ -647,11 +697,13 @@ export function createRecipe(): RecipeDefinition {
 
       // --- catalogue ---
 
-      const pushCatalog = async (force: boolean): Promise<void> => {
+      // Sent at start and when it changed, never again unchanged: the plugin keeps
+      // the last one and resends it to guestFlow hourly by itself, with no order.
+      const pushCatalog = async (): Promise<void> => {
         if (stopped) return;
-        const catalog = buildCatalog(ctx, whitelist, bridgeId);
+        const catalog = buildCatalog(ctx, whitelist, bridgeId, shared);
         const text = JSON.stringify(catalog);
-        if (!force && text === lastCatalog) return;
+        if (text === lastCatalog) return;
         lastCatalog = text;
         if (!(await send(ORDER_CATALOG, catalog, "catalogue"))) lastCatalog = "";
       };
@@ -660,7 +712,7 @@ export function createRecipe(): RecipeDefinition {
         if (stopped || catalogTimer) return;
         catalogTimer = setTimeout(() => {
           catalogTimer = null;
-          void pushCatalog(false);
+          void pushCatalog();
         }, CATALOG_DEBOUNCE_MS);
       };
 
@@ -668,33 +720,48 @@ export function createRecipe(): RecipeDefinition {
 
       const pushReadings = async (): Promise<void> => {
         if (stopped) return;
-        const now = Date.now();
         const pairs = selection().slice(0, MAX_SELECTION);
-        let changed = false;
-        for (const p of pairs) {
-          if (!(HOURLY_ALIASES as readonly string[]).includes(p.alias)) continue;
-          const eq = ctx.equipmentManager.getByIdWithDetails(p.equipmentId);
-          // Only what may leave the house is kept: a hostile selection cannot grow the state store.
-          if (!isReadable(eq, p.alias, bridgeId)) continue;
-          const cur = currentOf(eq, p.alias);
-          series = sampleHourly(series, pairKey(p), cur?.value, now);
-          changed = true;
-        }
-        series = keepSeries(series, new Set(pairs.map(pairKey)));
-        if (changed) ctx.state.set("series", series);
-        const readings = buildReadings(ctx, pairs, bridgeId);
-        if (readings.length) await send(ORDER_READINGS, readings, "relevés");
+        const selected = new Set(pairs.map(pairKey));
+        // A pair no longer selected is forgotten: selected again, it is sent again.
+        lastSent = new Map([...lastSent].filter(([k]) => selected.has(k)));
+        const changed = buildReadings(ctx, pairs, bridgeId, described).filter((r) => hasChanged(lastSent.get(pairKey(r)), r));
+        if (!changed.length) return;
+        if (!(await send(ORDER_READINGS, changed, "relevés"))) return;
+        for (const r of changed) lastSent.set(pairKey(r), { value: r.value, measuredAt: r.measuredAt });
       };
 
       const pushSeries = async (): Promise<void> => {
-        if (stopped) return;
-        const out = selection()
-          .slice(0, MAX_SELECTION)
-          .filter((p) => (HOURLY_ALIASES as readonly string[]).includes(p.alias))
-          .filter((p) => isReadable(ctx.equipmentManager.getByIdWithDetails(p.equipmentId), p.alias, bridgeId))
-          .map((p) => ({ equipmentId: p.equipmentId, alias: p.alias, buckets: series.buckets[pairKey(p)] ?? [] }))
-          .filter((s) => s.buckets.length > 0);
-        if (out.length) await send(ORDER_SERIES, out, "séries horaires");
+        if (stopped || !ctx.history) return;
+        const now = Date.now();
+        const hour = Math.floor(now / HOUR_MS);
+        const from = new Date(now - MAX_BUCKETS * HOUR_MS).toISOString();
+        const out: { equipmentId: string; alias: string; buckets: Bucket[] }[] = [];
+        for (const p of selection().slice(0, MAX_SELECTION)) {
+          if (!(HOURLY_ALIASES as readonly string[]).includes(p.alias)) continue;
+          const eq = ctx.equipmentManager.getByIdWithDetails(p.equipmentId);
+          if (!isReadable(eq, p.alias, bridgeId, described)) continue;
+          try {
+            const { points } = await ctx.history.query({
+              equipmentId: p.equipmentId,
+              alias: historyAliasOf(eq, p.alias),
+              from,
+              aggregation: "1h",
+            });
+            const buckets = bucketsOf(points ?? []);
+            if (buckets.length) out.push({ equipmentId: p.equipmentId, alias: p.alias, buckets });
+          } catch (err) {
+            ctx.log(`historique de « ${eq.name ?? p.equipmentId} » non lu — ${errText(err)}`, "warn");
+            return; // retried at the next tick, the hour not marked as sent
+          }
+        }
+        if (out.length && !(await send(ORDER_SERIES, out, "séries horaires"))) return;
+        seriesHour = hour;
+      };
+
+      /** Once per closed hour; the readings tick drives it. */
+      const tick = async (): Promise<void> => {
+        await pushReadings();
+        if (Math.floor(Date.now() / HOUR_MS) !== seriesHour) await pushSeries();
       };
 
       // --- commands ---
@@ -778,7 +845,8 @@ export function createRecipe(): RecipeDefinition {
         if (event.alias === DATA_SELECTION && !stopped && !selectionTimer) {
           selectionTimer = setTimeout(() => {
             selectionTimer = null;
-            void pushReadings();
+            seriesHour = -1;
+            void tick();
           }, SELECTION_DEBOUNCE_MS);
         }
       });
@@ -793,15 +861,13 @@ export function createRecipe(): RecipeDefinition {
       const initialSeq = bridgeValue(DATA_SEQ);
       if (typeof initialSeq === "number" && Number.isFinite(initialSeq)) lastSeq = initialSeq;
 
-      const readingsTimer = setInterval(() => void pushReadings(), READINGS_EVERY_MS);
-      const seriesTimer = setInterval(() => void pushSeries(), SERIES_EVERY_MS);
-      // Hourly, whatever changed: a plugin restarted without its memory gets it back.
-      const catalogHourly = setInterval(() => void pushCatalog(true), CATALOG_EVERY_MS);
+      const readingsTimer = setInterval(() => void tick(), READINGS_EVERY_MS);
 
-      void pushCatalog(false);
-      void pushSeries();
+      void pushCatalog();
       summary();
-      ctx.log(`Recette démarrée : ${whitelist.size} lumière${whitelist.size > 1 ? "s" : ""} confiée${whitelist.size > 1 ? "s" : ""} aux voyageurs`);
+      ctx.log(
+        `Recette démarrée : ${shared.size} capteur${shared.size > 1 ? "s" : ""} partagé${shared.size > 1 ? "s" : ""}, ${whitelist.size} lumière${whitelist.size > 1 ? "s" : ""} confiée${whitelist.size > 1 ? "s" : ""} aux voyageurs${ctx.history ? "" : " (sans historique Sowel : pas de séries horaires)"}`,
+      );
 
       return {
         stop(): void {
@@ -809,8 +875,6 @@ export function createRecipe(): RecipeDefinition {
           unsubData();
           for (const u of unsubs) u();
           clearInterval(readingsTimer);
-          clearInterval(seriesTimer);
-          clearInterval(catalogHourly);
           if (catalogTimer) clearTimeout(catalogTimer);
           catalogTimer = null;
           if (selectionTimer) clearTimeout(selectionTimer);

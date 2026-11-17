@@ -1,23 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  bucketsOf,
   buildCatalog,
   createRecipe,
-  keepSeries,
+  hasChanged,
+  historyAliasOf,
   lightOrder,
   pruneTimes,
-  sampleHourly,
   timeOf,
   timesOf,
   type EquipmentDetails,
   type RecipeContext,
-  type SeriesStore,
 } from "./index.js";
 
 // What these tests guard: the whitelist is the house's boundary. A command from
 // guestFlow must never reach anything but an entrusted light — not on a
 // restart, not on a repeated counter or id, not when stale, not beyond 20 an
-// hour per light — and every refusal is reported. Values leave only for the
-// selected pairs the catalogue describes.
+// hour per light — and every refusal is reported. Only the shared sensors and
+// the entrusted lights are ever described; values leave only for the selected
+// pairs the catalogue describes, only when they changed, and every figure is
+// one Sowel already holds.
 
 type Handler = (event: Record<string, unknown>) => void;
 
@@ -54,6 +56,27 @@ function makeHouse() {
         { alias: "temperature", category: "temperature", unit: "°C", value: 21.4, lastUpdated: ISO(NOW - 30_000) },
         { alias: "humidity", category: "humidity", unit: "%", value: 48, lastUpdated: ISO(NOW - 30_000) },
       ],
+      computedData: [
+        { alias: "temperature_min_today", category: "temperature", unit: "°C", value: 18.2, lastUpdated: ISO(NOW - 30_000) },
+        { alias: "temperature_max_today", category: "temperature", unit: "°C", value: 22.9, lastUpdated: ISO(NOW - 30_000) },
+      ],
+      orderBindings: [],
+    },
+    {
+      id: "eq-cave",
+      name: "Cave",
+      type: "sensor",
+      zoneId: "root",
+      dataBindings: [{ alias: "temperature", category: "temperature", unit: "°C", value: 12, lastUpdated: ISO(NOW) }],
+      orderBindings: [],
+    },
+    {
+      id: "eq-meter",
+      name: "Compteur gîte",
+      type: "energy_meter",
+      zoneId: "gite",
+      dataBindings: [{ alias: "energy", category: "energy", unit: "Wh", value: 0, lastUpdated: ISO(NOW) }],
+      computedData: [{ alias: "energy_hour", category: "energy", unit: "Wh", value: 40, lastUpdated: ISO(NOW) }],
       orderBindings: [],
     },
     {
@@ -102,7 +125,9 @@ function makeHouse() {
   return { zones, eqs };
 }
 
-function makeCtx(opts: { state?: Record<string, unknown>; failOrders?: boolean } = {}) {
+type History = NonNullable<RecipeContext["history"]>;
+
+function makeCtx(opts: { state?: Record<string, unknown>; failOrders?: boolean; failBridge?: () => boolean; history?: History } = {}) {
   const { zones, eqs } = makeHouse();
   const logs: { message: string; level: string }[] = [];
   const state = new Map<string, unknown>(Object.entries(opts.state ?? {}));
@@ -125,10 +150,12 @@ function makeCtx(opts: { state?: Record<string, unknown>; failOrders?: boolean }
     },
     zoneManager: { getById: (id) => zones.get(id) },
     dispatchOrder: async (equipmentId, alias, value) => {
+      if (equipmentId === BRIDGE && opts.failBridge?.()) return { success: false, error: "plugin stopped" };
       orders.push({ equipmentId, alias, value });
       if (opts.failOrders && equipmentId !== BRIDGE) return { success: false, error: "device offline" };
       return { success: true };
     },
+    ...(opts.history ? { history: opts.history } : {}),
   };
   const emit = (type: string, event: Record<string, unknown>) => {
     for (const h of handlers.filter((x) => x.type === type)) h.handler(event);
@@ -150,7 +177,7 @@ function makeCtx(opts: { state?: Record<string, unknown>; failOrders?: boolean }
   return { ctx, logs, state, orders, handlers, emit, eqs, setBridge, sendCommand, toBridge, toHouse };
 }
 
-const PARAMS = { zone: "root", bridge: BRIDGE, lights: ["eq-lamp", "eq-terrace"] };
+const PARAMS = { zone: "root", bridge: BRIDGE, sensors: ["eq-temp", "eq-weather", "eq-meter"], lights: ["eq-lamp", "eq-terrace"] };
 const cmd = (id: number, equipmentId: string, value = "on", age = 5_000, propertyId = 1) => ({
   id,
   propertyId,
@@ -172,6 +199,8 @@ describe("validation", () => {
     expect(() => recipe.validate({ ...PARAMS, lights: ["eq-pump"] }, ctx)).toThrow(/not a light/);
     expect(() => recipe.validate({ ...PARAMS, lights: ["eq-gate"] }, ctx)).toThrow(/not a light/);
     expect(() => recipe.validate({ ...PARAMS, lights: ["nope"] }, ctx)).toThrow(/not found/);
+    expect(() => recipe.validate({ ...PARAMS, sensors: ["nope"] }, ctx)).toThrow(/Shared sensor not found/);
+    expect(() => recipe.validate({ ...PARAMS, sensors: ["eq-gate"] }, ctx)).toThrow(/cannot be shared/);
     eqs[0].orderBindings = eqs[0].orderBindings!.filter((o) => o.alias !== "home_result");
     expect(() => recipe.validate(PARAMS, ctx)).toThrow(/home_result/);
   });
@@ -181,14 +210,21 @@ describe("validation", () => {
     expect(slot).toMatchObject({ type: "equipment", list: true });
     expect(slot.constraints?.equipmentType).toEqual(["light_onoff", "light_dimmable", "light_color", "switch"]);
   });
+
+  it("declares « Capteurs partagés » as a multi-select of sensors, meters and stations, no light", () => {
+    const slot = createRecipe().slots.find((s) => s.id === "sensors")!;
+    expect(slot).toMatchObject({ type: "equipment", list: true, required: false });
+    expect(slot.constraints?.equipmentType).toEqual(["sensor", "thermostat", "weather", "energy_meter", "main_energy_meter"]);
+  });
 });
 
 describe("the catalogue", () => {
-  it("describes the catalogued types with zone path and readable values, no value, guestSwitchable exactly for the whitelist", () => {
+  it("describes only the shared sensors and the entrusted lights, with zone path and readable values, no value", () => {
     const { ctx } = makeCtx();
-    const catalog = buildCatalog(ctx, new Set(PARAMS.lights), BRIDGE);
-    // By zone path then name; the bridge, the pump (a switch that is no light) and the gate left out.
-    expect(catalog.map((e) => e.id)).toEqual(["eq-weather", "eq-terrace", "eq-hall", "eq-lamp", "eq-temp"]);
+    const catalog = buildCatalog(ctx, new Set(PARAMS.lights), BRIDGE, new Set(PARAMS.sensors));
+    // By zone path then name. Left out: the cellar (not shared), the hall light (not entrusted), the bridge, the
+    // pump, the gate — whatever their type.
+    expect(catalog.map((e) => e.id)).toEqual(["eq-weather", "eq-terrace", "eq-meter", "eq-lamp", "eq-temp"]);
     const byId = Object.fromEntries(catalog.map((e) => [e.id, e]));
     expect(byId["eq-temp"]).toEqual({
       id: "eq-temp",
@@ -198,16 +234,23 @@ describe("the catalogue", () => {
       readings: [
         { alias: "temperature", category: "temperature", unit: "°C" },
         { alias: "humidity", category: "humidity", unit: "%" },
+        { alias: "temperature_min_today", category: "temperature", unit: "°C" },
+        { alias: "temperature_max_today", category: "temperature", unit: "°C" },
       ],
     });
     expect(byId["eq-weather"].readings).toContainEqual({ alias: "rain_1h", category: "rain", unit: "mm" });
     expect(byId["eq-lamp"].guestSwitchable).toBe(true);
     expect(byId["eq-terrace"].guestSwitchable).toBe(true);
-    expect(byId["eq-hall"].guestSwitchable).toBe(false);
     expect(byId["eq-temp"]).not.toHaveProperty("guestSwitchable");
-    expect(byId["eq-pump"]).toBeUndefined(); // a switch that is no light
-    expect(byId["eq-gate"]).toBeUndefined();
+    expect(byId["eq-hall"]).toBeUndefined();
+    expect(byId["eq-cave"]).toBeUndefined();
     expect(JSON.stringify(catalog)).not.toMatch(/21\.4|"OFF"|0\.4/);
+  });
+
+  it("describes no sensor at all when none is shared; a gate shared by an old configuration stays out", () => {
+    const { ctx } = makeCtx();
+    expect(buildCatalog(ctx, new Set(PARAMS.lights), BRIDGE, new Set()).map((e) => e.id)).toEqual(["eq-terrace", "eq-lamp"]);
+    expect(buildCatalog(ctx, new Set(), BRIDGE, new Set(["eq-gate", BRIDGE])).map((e) => e.id)).toEqual([]);
   });
 
   it("is sent at start, again on an equipment change, never twice the same", async () => {
@@ -225,23 +268,25 @@ describe("the catalogue", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(toBridge("home_catalog")).toHaveLength(2);
     expect(toBridge("home_catalog")[1].find((e: { id: string }) => e.id === "eq-temp").name).toBe("Salon");
+    // No hourly resend of an unchanged catalogue: the plugin keeps it and resends it to guestFlow itself.
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+    expect(toBridge("home_catalog")).toHaveLength(2);
     handle.stop();
   });
 });
 
-describe("readings and series", () => {
-  it("every 60 s, sends the selection's values only; a pair whose equipment is gone is skipped", async () => {
+describe("readings", () => {
+  const SELECTION = [
+    { equipmentId: "eq-temp", alias: "temperature" },
+    { equipmentId: "eq-weather", alias: "rain_1h" },
+    { equipmentId: "eq-gone", alias: "temperature" },
+  ];
+
+  it("sends the selection's values once, then only a value that changed, alone", async () => {
     vi.useFakeTimers({ now: NOW });
-    const { ctx, setBridge, toBridge } = makeCtx();
+    const { ctx, setBridge, toBridge, eqs } = makeCtx();
     const handle = createRecipe().createInstance(PARAMS, ctx);
-    setBridge(
-      "home_selection",
-      JSON.stringify([
-        { equipmentId: "eq-temp", alias: "temperature" },
-        { equipmentId: "eq-weather", alias: "rain_1h" },
-        { equipmentId: "eq-gone", alias: "temperature" },
-      ]),
-    );
+    setBridge("home_selection", JSON.stringify(SELECTION));
     await vi.advanceTimersByTimeAsync(2_000);
     expect(toBridge("home_readings")).toEqual([
       [
@@ -249,45 +294,67 @@ describe("readings and series", () => {
         { equipmentId: "eq-weather", alias: "rain_1h", value: 0.4, unit: "mm", measuredAt: ISO(NOW) },
       ],
     ]);
+    // Re-reported by Sowel with the same value: nothing goes out.
+    eqs.find((e) => e.id === "eq-temp")!.dataBindings![0].lastUpdated = ISO(NOW + 60_000);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(toBridge("home_readings")).toHaveLength(1);
+    const temp = eqs.find((e) => e.id === "eq-temp")!.dataBindings![0];
+    temp.value = 21.6;
+    temp.lastUpdated = ISO(NOW + 4 * 60_000);
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(toBridge("home_readings")).toHaveLength(2);
-    expect(JSON.stringify(toBridge("home_readings"))).not.toContain("humidity");
+    expect(toBridge("home_readings")[1]).toEqual([
+      { equipmentId: "eq-temp", alias: "temperature", value: 21.6, unit: "°C", measuredAt: ISO(NOW + 4 * 60_000) },
+    ]);
     handle.stop();
   });
 
-  it("records the previous hour's value at each boundary, keeps 24 buckets, and sends them every 15 min", async () => {
-    vi.useFakeTimers({ now: Date.parse("2026-11-15T10:00:30Z") });
-    const { ctx, setBridge, toBridge, eqs, state } = makeCtx();
+  it("resends a steady value an hour after its last send, so guestFlow knows Sowel still reports it", () => {
+    const r = { equipmentId: "a", alias: "t", value: 20, unit: null, measuredAt: ISO(NOW + 59 * 60_000) };
+    expect(hasChanged({ value: 20, measuredAt: ISO(NOW) }, r)).toBe(false);
+    expect(hasChanged({ value: 20, measuredAt: ISO(NOW) }, { ...r, measuredAt: ISO(NOW + 60 * 60_000) })).toBe(true);
+    expect(hasChanged({ value: 20, measuredAt: ISO(NOW) }, { ...r, value: 20.1 })).toBe(true);
+    expect(hasChanged(undefined, r)).toBe(true);
+  });
+
+  it("retries a send that failed, and sends a pair selected again", async () => {
+    vi.useFakeTimers({ now: NOW });
+    let fail = true;
+    const { ctx, setBridge, toBridge } = makeCtx({ failBridge: () => fail });
     const handle = createRecipe().createInstance(PARAMS, ctx);
-    setBridge("home_selection", JSON.stringify([{ equipmentId: "eq-weather", alias: "rain_1h" }]));
-    const rain = eqs.find((e) => e.id === "eq-weather")!.computedData![0];
-    rain.value = 1.2;
-    await vi.advanceTimersByTimeAsync(59 * 60_000); // 10:59:30, last sample of the hour: 1.2
-    rain.value = 0;
-    await vi.advanceTimersByTimeAsync(60_000); // 11:00:30 — the 10:00 bucket closes
-    expect((state.get("series") as SeriesStore).buckets["eq-weather|rain_1h"]).toEqual([
-      { time: "2026-11-15T10:00:00.000Z", value: 1.2 },
-    ]);
-    await vi.advanceTimersByTimeAsync(15 * 60_000);
-    const sent = toBridge("home_series");
-    expect(sent.at(-1)).toEqual([
-      { equipmentId: "eq-weather", alias: "rain_1h", buckets: [{ time: "2026-11-15T10:00:00.000Z", value: 1.2 }] },
+    setBridge("home_selection", JSON.stringify(SELECTION.slice(0, 1)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(toBridge("home_readings")).toHaveLength(0);
+    fail = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(toBridge("home_readings")).toHaveLength(1);
+    setBridge("home_selection", "[]");
+    await vi.advanceTimersByTimeAsync(2_000);
+    setBridge("home_selection", JSON.stringify(SELECTION.slice(0, 1)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(toBridge("home_readings")).toHaveLength(2);
+    handle.stop();
+  });
+
+  it("relays the day's min/max Sowel tracks, as readings of their own aliases", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const { ctx, setBridge, toBridge } = makeCtx();
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge(
+      "home_selection",
+      JSON.stringify([
+        { equipmentId: "eq-temp", alias: "temperature_min_today" },
+        { equipmentId: "eq-temp", alias: "temperature_max_today" },
+      ]),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(toBridge("home_readings")[0].map((r: { alias: string; value: number }) => [r.alias, r.value])).toEqual([
+      ["temperature_min_today", 18.2],
+      ["temperature_max_today", 22.9],
     ]);
     handle.stop();
   });
 
-  it("keeps a 24-bucket window, and a sample left from before a long stop makes no bucket", () => {
-    let store: SeriesStore = { pending: {}, buckets: {} };
-    const t0 = Date.parse("2026-11-14T00:10:00Z");
-    for (let h = 0; h < 30; h += 1) store = sampleHourly(store, "k", h, t0 + h * 3_600_000);
-    expect(store.buckets.k).toHaveLength(24);
-    expect(store.buckets.k[23]).toEqual({ time: "2026-11-15T04:00:00.000Z", value: 28 });
-    store = sampleHourly(store, "k", 5, t0 + 40 * 3_600_000);
-    expect(store.buckets.k.at(-1)?.value).toBe(28);
-    expect(store.buckets.k.length).toBeLessThan(24); // the window slid by 11 hours
-  });
-
-  it("sends nothing guestFlow selected outside the catalogue: not the bridge, not an uncatalogued equipment, not an unknown alias", async () => {
+  it("sends nothing outside the catalogue: not the bridge, not an unshared sensor, not an unentrusted light, not an unknown alias", async () => {
     vi.useFakeTimers({ now: NOW });
     const { ctx, setBridge, toBridge } = makeCtx();
     const handle = createRecipe().createInstance(PARAMS, ctx);
@@ -296,6 +363,8 @@ describe("readings and series", () => {
       JSON.stringify([
         { equipmentId: BRIDGE, alias: "home_command" },
         { equipmentId: "eq-pump", alias: "state" },
+        { equipmentId: "eq-cave", alias: "temperature" },
+        { equipmentId: "eq-hall", alias: "state" },
         { equipmentId: "eq-temp", alias: "secret" },
         { equipmentId: "eq-temp", alias: "humidity" },
       ]),
@@ -306,10 +375,94 @@ describe("readings and series", () => {
     ]);
     handle.stop();
   });
+});
 
-  it("forgets the series of a pair no longer selected", () => {
-    const store: SeriesStore = { pending: { a: { hour: 0, value: 1 }, b: { hour: 0, value: 2 } }, buckets: { a: [], b: [] } };
-    expect(keepSeries(store, new Set(["a"]))).toEqual({ pending: { a: { hour: 0, value: 1 } }, buckets: { a: [] } });
+describe("series", () => {
+  const hourly = [
+    { equipmentId: "eq-meter", alias: "energy_hour" },
+    { equipmentId: "eq-weather", alias: "rain_1h" },
+    { equipmentId: "eq-cave", alias: "energy_hour" },
+  ];
+
+  it("come from Sowel's history once per hour, unchanged, on the binding Sowel historises", async () => {
+    vi.useFakeTimers({ now: Date.parse("2026-11-15T10:00:30Z") });
+    const calls: { equipmentId: string; alias: string; from: string; aggregation: string }[] = [];
+    const history = {
+      query: async (q: { equipmentId: string; alias: string; from: string; aggregation: "1h" | "1d" }) => {
+        calls.push(q);
+        return {
+          points: [
+            { time: "2026-11-15T08:00:00Z", value: 30 },
+            { time: "2026-11-15T09:00:00Z", value: -5 },
+            { time: "2026-11-15T10:00:00Z", value: 40, min: 1, max: 2 },
+          ],
+        };
+      },
+    };
+    const { ctx, setBridge, toBridge } = makeCtx({ history });
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge("home_selection", JSON.stringify(hourly));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(calls.map((c) => [c.equipmentId, c.alias, c.aggregation, c.from])).toEqual([
+      ["eq-meter", "energy", "1h", "2026-11-14T10:00:32.000Z"],
+      ["eq-weather", "rain_1h", "1h", "2026-11-14T10:00:32.000Z"],
+    ]);
+    const buckets = [
+      { time: "2026-11-15T08:00:00Z", value: 30 },
+      { time: "2026-11-15T10:00:00Z", value: 40 },
+    ];
+    expect(toBridge("home_series")).toEqual([
+      [
+        { equipmentId: "eq-meter", alias: "energy_hour", buckets },
+        { equipmentId: "eq-weather", alias: "rain_1h", buckets },
+      ],
+    ]);
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(toBridge("home_series")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(30 * 60_000); // 11:00:32 — a new hour closed
+    expect(toBridge("home_series")).toHaveLength(2);
+    handle.stop();
+  });
+
+  it("are never estimated: without Sowel's history, none is sent", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const { ctx, setBridge, toBridge, logs } = makeCtx();
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge("home_selection", JSON.stringify(hourly));
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+    expect(toBridge("home_series")).toEqual([]);
+    expect(logs[0].message).toMatch(/sans historique Sowel/);
+    handle.stop();
+  });
+
+  it("retry at the next tick when Sowel refuses a history read", async () => {
+    vi.useFakeTimers({ now: NOW });
+    let refuse = true;
+    const history = {
+      query: async () => {
+        if (refuse) throw new Error("history rate limit");
+        return { points: [{ time: "2026-11-15T09:00:00Z", value: 1 }] };
+      },
+    };
+    const { ctx, setBridge, toBridge, logs } = makeCtx({ history });
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge("home_selection", JSON.stringify(hourly.slice(0, 1)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(toBridge("home_series")).toEqual([]);
+    expect(logs.some((l) => l.level === "warn" && /history rate limit/.test(l.message))).toBe(true);
+    refuse = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(toBridge("home_series")).toHaveLength(1);
+    handle.stop();
+  });
+
+  it("keep finite, non-negative points, 24 at most; read the binding named by the alias's category", () => {
+    const pts = Array.from({ length: 30 }, (_, i) => ({ time: `t${i}`, value: i }));
+    expect(bucketsOf(pts)).toHaveLength(24);
+    expect(bucketsOf([{ time: "t", value: Number.NaN }, { time: "u", value: -1 }])).toEqual([]);
+    const { eqs } = makeCtx();
+    expect(historyAliasOf(eqs.find((e) => e.id === "eq-meter")!, "energy_hour")).toBe("energy");
+    expect(historyAliasOf(eqs.find((e) => e.id === "eq-weather")!, "rain_1h")).toBe("rain_1h");
   });
 });
 

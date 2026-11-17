@@ -1,6 +1,6 @@
 {
   "name": "sowel-recipe-guest-home",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shows guests the house's readings and lets them switch the lights the owner entrusts to them, through the guestFlow plugin",
   "type": "module",
   "main": "dist/index.js",

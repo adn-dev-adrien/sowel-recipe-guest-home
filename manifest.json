@@ -2,7 +2,7 @@
   "id": "guest-home",
   "type": "recipe",
   "name": "Guest home automation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shows guests the house's readings and lets them switch the lights you entrust to them, through the guestFlow plugin. One for the whole house.",
   "icon": "Lightbulb",
   "repo": "adn-dev-adrien/sowel-recipe-guest-home",
