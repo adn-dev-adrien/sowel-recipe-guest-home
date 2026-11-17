@@ -55,9 +55,12 @@ a changé**.
   `temperature_max_today`) : relayé comme une mesure ordinaire quand l'équipement l'a — aujourd'hui
   les stations météo ; les simples sondes avec la spec 211 de sowel-core.
 - **Les séries** — une fois par heure close, les 24 dernières tranches horaires de la pluie et de
-  l'énergie, **lues dans l'historique de Sowel** (`ctx.history`, spec 211 de sowel-core) et
-  transmises telles quelles. Sans cet accès (un Sowel plus ancien), aucune série n'est envoyée —
-  jamais d'estimation ; tout le reste fonctionne.
+  l'énergie, **lues dans l'historique de Sowel** (`ctx.helpers.history`, spec 211 de sowel-core) et
+  transmises telles quelles : des heures complètes seulement, chacune datée de son début, jamais
+  l'heure en cours. Sans cet accès (un Sowel plus ancien), aucune série n'est envoyée — jamais
+  d'estimation ; tout le reste fonctionne. Un historique indisponible (`ok: false`) n'est pas une
+  absence de pluie : rien n'est envoyé et la lecture est refaite à la minute suivante ; un refus de
+  débit garde ce qui a déjà été lu et reprend là où il s'était arrêté.
 - **Les commandes** — une commande n'est exécutée que si **tout** tient :
   1. il est coché dans « Lumières confiées aux voyageurs » (vérifié en premier : un refus ne dit
      rien d'un équipement inconnu) ;

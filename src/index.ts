@@ -131,18 +131,27 @@ export interface RecipeContext {
     value: unknown,
   ): Promise<{ success?: boolean; error?: string } | void>;
   /**
-   * Sowel's own history, read-only (sowel-core spec 211 R2). Optional: an older
-   * core has none, and the recipe then sends no series rather than estimate one.
+   * Read-only helpers of the core. `history` is Sowel's own history (sowel-core spec 211 FR2), optional: an
+   * older core has none, and the recipe then sends no series rather than estimate one.
    */
-  history?: {
-    query(params: {
-      equipmentId: string;
-      alias: string;
-      from: string;
-      to?: string;
-      aggregation: "1h" | "1d";
-    }): Promise<{ points: { time: string; value: number; min?: number; max?: number }[] }>;
+  helpers?: {
+    history?: HistoryHelper;
   };
+}
+
+/**
+ * sowel-core spec 211 FR2: complete periods only, each point stamped at the start of its period, sparse points
+ * (an hour without samples has none). `ok: false` = Influx not configured, unreachable or failing — not « no
+ * data ». Rejects with `Error("history rate limit")` beyond 10 calls a minute.
+ */
+export interface HistoryHelper {
+  query(params: {
+    equipmentId: string;
+    alias: string;
+    from: string;
+    to?: string;
+    aggregation: "1h" | "1d";
+  }): Promise<{ points: { time: string; value: number; min?: number; max?: number }[]; ok: boolean }>;
 }
 
 interface RecipeInstanceHandle {
@@ -394,10 +403,10 @@ export function hasChanged(last: { value: unknown; measuredAt: string } | undefi
 }
 
 /**
- * The alias Sowel historises for an hourly figure. `energy_hour` and the rain
- * gauge's hourly cumuls are live computed values; their history is the
- * underlying binding's, whose alias names its category (`energy`, `rain`).
- * Falls back to the alias itself.
+ * The alias Sowel historises for an hourly figure (spec 211 FR2.3: a binding, else a computed value).
+ * `energy_hour` and the rain gauge's hourly cumuls are live computed values; their history is the
+ * underlying binding's, whose alias names its category (`energy`, `rain`). Falls back to the alias
+ * itself — the helper answers `[]` for an alias it cannot resolve.
  */
 export function historyAliasOf(eq: EquipmentDetails, alias: string): string {
   const all = [...(eq.dataBindings ?? []), ...(eq.computedData ?? [])];
@@ -664,6 +673,12 @@ export function createRecipe(): RecipeDefinition {
       let lastSent = new Map<string, { value: unknown; measuredAt: string }>();
       /** The hour whose series were last sent; -1 = never. */
       let seriesHour = -1;
+      /**
+       * This hour's round of history reads: what was read so far is kept, so a rate refusal or an outage
+       * resumes with the pairs still missing at the next tick instead of starting over (spec 211 FR2.7).
+       */
+      let round: { hour: number; done: Set<string>; out: { equipmentId: string; alias: string; buckets: Bucket[] }[] } | null = null;
+      const history = ctx.helpers?.history;
       // 0.1.0 kept its own hourly samples here; Sowel's history replaces them.
       if (ctx.state.get("series") !== null) ctx.state.set("series", null);
       let rate = timesOf(ctx.state.get("rate"));
@@ -731,31 +746,38 @@ export function createRecipe(): RecipeDefinition {
       };
 
       const pushSeries = async (): Promise<void> => {
-        if (stopped || !ctx.history) return;
-        const now = Date.now();
-        const hour = Math.floor(now / HOUR_MS);
-        const from = new Date(now - MAX_BUCKETS * HOUR_MS).toISOString();
-        const out: { equipmentId: string; alias: string; buckets: Bucket[] }[] = [];
+        if (stopped || !history) return;
+        const hour = Math.floor(Date.now() / HOUR_MS);
+        if (!round || round.hour !== hour) round = { hour, done: new Set(), out: [] };
+        const current = round;
+        let complete = true;
         for (const p of selection().slice(0, MAX_SELECTION)) {
           if (!(HOURLY_ALIASES as readonly string[]).includes(p.alias)) continue;
+          if (current.done.has(pairKey(p))) continue;
           const eq = ctx.equipmentManager.getByIdWithDetails(p.equipmentId);
           if (!isReadable(eq, p.alias, bridgeId, described)) continue;
+          let answer: Awaited<ReturnType<HistoryHelper["query"]>>;
           try {
-            const { points } = await ctx.history.query({
-              equipmentId: p.equipmentId,
-              alias: historyAliasOf(eq, p.alias),
-              from,
-              aggregation: "1h",
-            });
-            const buckets = bucketsOf(points ?? []);
-            if (buckets.length) out.push({ equipmentId: p.equipmentId, alias: p.alias, buckets });
+            // The running hour is never asked for: the helper returns complete hours only.
+            answer = await history.query({ equipmentId: p.equipmentId, alias: historyAliasOf(eq, p.alias), from: "-24h", aggregation: "1h" });
           } catch (err) {
             ctx.log(`historique de « ${eq.name ?? p.equipmentId} » non lu — ${errText(err)}`, "warn");
-            return; // retried at the next tick, the hour not marked as sent
+            return; // a rate refusal: what was read stays in `round`, the rest at the next tick
           }
+          if (!answer || answer.ok !== true) {
+            // An outage, not an empty series: nothing is sent for this pair, retried at the next tick.
+            ctx.log(`historique de « ${eq.name ?? p.equipmentId} » indisponible`, "warn");
+            complete = false;
+            continue;
+          }
+          const buckets = bucketsOf(answer.points ?? []);
+          if (buckets.length) current.out.push({ equipmentId: p.equipmentId, alias: p.alias, buckets });
+          current.done.add(pairKey(p));
         }
-        if (out.length && !(await send(ORDER_SERIES, out, "séries horaires"))) return;
+        if (!complete) return;
+        if (current.out.length && !(await send(ORDER_SERIES, current.out, "séries horaires"))) return;
         seriesHour = hour;
+        round = null;
       };
 
       /** Once per closed hour; the readings tick drives it. */
@@ -846,6 +868,7 @@ export function createRecipe(): RecipeDefinition {
           selectionTimer = setTimeout(() => {
             selectionTimer = null;
             seriesHour = -1;
+            round = null;
             void tick();
           }, SELECTION_DEBOUNCE_MS);
         }
@@ -866,7 +889,7 @@ export function createRecipe(): RecipeDefinition {
       void pushCatalog();
       summary();
       ctx.log(
-        `Recette démarrée : ${shared.size} capteur${shared.size > 1 ? "s" : ""} partagé${shared.size > 1 ? "s" : ""}, ${whitelist.size} lumière${whitelist.size > 1 ? "s" : ""} confiée${whitelist.size > 1 ? "s" : ""} aux voyageurs${ctx.history ? "" : " (sans historique Sowel : pas de séries horaires)"}`,
+        `Recette démarrée : ${shared.size} capteur${shared.size > 1 ? "s" : ""} partagé${shared.size > 1 ? "s" : ""}, ${whitelist.size} lumière${whitelist.size > 1 ? "s" : ""} confiée${whitelist.size > 1 ? "s" : ""} aux voyageurs${history ? "" : " (sans historique Sowel : pas de séries horaires)"}`,
       );
 
       return {
