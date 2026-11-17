@@ -5,6 +5,7 @@ import {
   createRecipe,
   hasChanged,
   historyAliasOf,
+  type HistoryHelper,
   lightOrder,
   pruneTimes,
   timeOf,
@@ -125,7 +126,7 @@ function makeHouse() {
   return { zones, eqs };
 }
 
-type History = NonNullable<RecipeContext["history"]>;
+type History = HistoryHelper;
 
 function makeCtx(opts: { state?: Record<string, unknown>; failOrders?: boolean; failBridge?: () => boolean; history?: History } = {}) {
   const { zones, eqs } = makeHouse();
@@ -155,7 +156,7 @@ function makeCtx(opts: { state?: Record<string, unknown>; failOrders?: boolean; 
       if (opts.failOrders && equipmentId !== BRIDGE) return { success: false, error: "device offline" };
       return { success: true };
     },
-    ...(opts.history ? { history: opts.history } : {}),
+    ...(opts.history ? { helpers: { history: opts.history } } : {}),
   };
   const emit = (type: string, event: Record<string, unknown>) => {
     for (const h of handlers.filter((x) => x.type === type)) h.handler(event);
@@ -386,11 +387,12 @@ describe("series", () => {
 
   it("come from Sowel's history once per hour, unchanged, on the binding Sowel historises", async () => {
     vi.useFakeTimers({ now: Date.parse("2026-11-15T10:00:30Z") });
-    const calls: { equipmentId: string; alias: string; from: string; aggregation: string }[] = [];
+    const calls: { equipmentId: string; alias: string; from: string; to?: string; aggregation: string }[] = [];
     const history = {
-      query: async (q: { equipmentId: string; alias: string; from: string; aggregation: "1h" | "1d" }) => {
+      query: async (q: { equipmentId: string; alias: string; from: string; to?: string; aggregation: "1h" | "1d" }) => {
         calls.push(q);
         return {
+          ok: true,
           points: [
             { time: "2026-11-15T08:00:00Z", value: 30 },
             { time: "2026-11-15T09:00:00Z", value: -5 },
@@ -403,9 +405,10 @@ describe("series", () => {
     const handle = createRecipe().createInstance(PARAMS, ctx);
     setBridge("home_selection", JSON.stringify(hourly));
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(calls.map((c) => [c.equipmentId, c.alias, c.aggregation, c.from])).toEqual([
-      ["eq-meter", "energy", "1h", "2026-11-14T10:00:32.000Z"],
-      ["eq-weather", "rain_1h", "1h", "2026-11-14T10:00:32.000Z"],
+    // Spec 211 FR2: the running hour is never asked for — no `to`, complete hours only.
+    expect(calls.map((c) => [c.equipmentId, c.alias, c.aggregation, c.from, c.to])).toEqual([
+      ["eq-meter", "energy", "1h", "-24h", undefined],
+      ["eq-weather", "rain_1h", "1h", "-24h", undefined],
     ]);
     const buckets = [
       { time: "2026-11-15T08:00:00Z", value: 30 },
@@ -441,7 +444,7 @@ describe("series", () => {
     const history = {
       query: async () => {
         if (refuse) throw new Error("history rate limit");
-        return { points: [{ time: "2026-11-15T09:00:00Z", value: 1 }] };
+        return { ok: true, points: [{ time: "2026-11-15T09:00:00Z", value: 1 }] };
       },
     };
     const { ctx, setBridge, toBridge, logs } = makeCtx({ history });
@@ -453,6 +456,75 @@ describe("series", () => {
     refuse = false;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(toBridge("home_series")).toHaveLength(1);
+    handle.stop();
+  });
+
+  it("an outage (ok: false) sends nothing for that pair and is retried at the next tick; an empty answer is a series", async () => {
+    vi.useFakeTimers({ now: NOW });
+    let down = true;
+    const asked: string[] = [];
+    const history = {
+      query: async (q: { equipmentId: string }) => {
+        asked.push(q.equipmentId);
+        if (q.equipmentId === "eq-meter") return down ? { ok: false, points: [] } : { ok: true, points: [{ time: "2026-11-15T09:00:00Z", value: 3 }] };
+        return { ok: true, points: [] };
+      },
+    };
+    const { ctx, setBridge, toBridge, logs } = makeCtx({ history });
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge("home_selection", JSON.stringify(hourly.slice(0, 2)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(toBridge("home_series")).toEqual([]);
+    expect(logs.some((l) => l.level === "warn" && /indisponible/.test(l.message))).toBe(true);
+    down = false;
+    asked.length = 0;
+    await vi.advanceTimersByTimeAsync(60_000);
+    // The rain gauge answered « empty, ok » the first time: it is not asked again this hour.
+    expect(asked).toEqual(["eq-meter"]);
+    expect(toBridge("home_series")).toEqual([
+      [{ equipmentId: "eq-meter", alias: "energy_hour", buckets: [{ time: "2026-11-15T09:00:00Z", value: 3 }] }],
+    ]);
+    handle.stop();
+  });
+
+  it("a rate refusal keeps what was read and resumes with the next pair at the next tick", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const asked: string[] = [];
+    let refuseWeather = true;
+    const history = {
+      query: async (q: { equipmentId: string }) => {
+        asked.push(q.equipmentId);
+        if (q.equipmentId === "eq-weather" && refuseWeather) throw new Error("history rate limit");
+        return { ok: true, points: [{ time: "2026-11-15T09:00:00Z", value: q.equipmentId === "eq-meter" ? 5 : 0.2 }] };
+      },
+    };
+    const { ctx, setBridge, toBridge } = makeCtx({ history });
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge("home_selection", JSON.stringify(hourly.slice(0, 2)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(asked).toEqual(["eq-meter", "eq-weather"]);
+    expect(toBridge("home_series")).toEqual([]);
+    refuseWeather = false;
+    asked.length = 0;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(asked).toEqual(["eq-weather"]);
+    expect(toBridge("home_series")).toEqual([[
+      { equipmentId: "eq-meter", alias: "energy_hour", buckets: [{ time: "2026-11-15T09:00:00Z", value: 5 }] },
+      { equipmentId: "eq-weather", alias: "rain_1h", buckets: [{ time: "2026-11-15T09:00:00Z", value: 0.2 }] },
+    ]]);
+    handle.stop();
+  });
+
+  it("the history is read under ctx.helpers only: a `history` at the context's root is ignored", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const query = vi.fn(async () => ({ ok: true, points: [{ time: "2026-11-15T09:00:00Z", value: 1 }] }));
+    const { ctx, setBridge, toBridge } = makeCtx();
+    (ctx as unknown as { history: unknown }).history = { query };
+    const handle = createRecipe().createInstance(PARAMS, ctx);
+    setBridge("home_selection", JSON.stringify(hourly));
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(query).not.toHaveBeenCalled();
+    expect(toBridge("home_series")).toEqual([]);
     handle.stop();
   });
 
