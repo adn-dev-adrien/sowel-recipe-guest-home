@@ -405,10 +405,11 @@ describe("series", () => {
     const handle = createRecipe().createInstance(PARAMS, ctx);
     setBridge("home_selection", JSON.stringify(hourly));
     await vi.advanceTimersByTimeAsync(2_000);
-    // Spec 211 FR2: the running hour is never asked for — no `to`, complete hours only.
+    // Spec 211 FR2: the running hour is never asked for — no `to`, complete hours only. The first,
+    // cut hour is dropped too, so "-25h" brings the 24 last complete ones.
     expect(calls.map((c) => [c.equipmentId, c.alias, c.aggregation, c.from, c.to])).toEqual([
-      ["eq-meter", "energy", "1h", "-24h", undefined],
-      ["eq-weather", "rain_1h", "1h", "-24h", undefined],
+      ["eq-meter", "energy", "1h", "-25h", undefined],
+      ["eq-weather", "rain_1h", "1h", "-25h", undefined],
     ]);
     const buckets = [
       { time: "2026-11-15T08:00:00Z", value: 30 },

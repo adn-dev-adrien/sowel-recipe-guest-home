@@ -758,8 +758,10 @@ export function createRecipe(): RecipeDefinition {
           if (!isReadable(eq, p.alias, bridgeId, described)) continue;
           let answer: Awaited<ReturnType<HistoryHelper["query"]>>;
           try {
-            // The running hour is never asked for: the helper returns complete hours only.
-            answer = await history.query({ equipmentId: p.equipmentId, alias: historyAliasOf(eq, p.alias), from: "-24h", aggregation: "1h" });
+            // The running hour is never asked for: the helper returns complete hours only, and
+            // drops the first, cut one (`from` is rounded up to the next hour). "-25h" therefore
+            // yields the 24 last complete hours; "-24h" would give 23.
+            answer = await history.query({ equipmentId: p.equipmentId, alias: historyAliasOf(eq, p.alias), from: "-25h", aggregation: "1h" });
           } catch (err) {
             ctx.log(`historique de « ${eq.name ?? p.equipmentId} » non lu — ${errText(err)}`, "warn");
             return; // a rate refusal: what was read stays in `round`, the rest at the next tick
